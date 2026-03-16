@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f8f9fa;
+            display: flex;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+
+        .doc-wrapper {
+            background: white;
+            width: 700px;
+            min-height: 500px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+            border-radius: 2px;
+            padding: 60px 80px;
+        }
+
+        #editor {
+            min-height: 300px;
+            font-size: 1rem;
+            line-height: 1.6;
+            outline: none;
+            color: #202124;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        #editor:empty:before {
+            content: attr(placeholder);
+            color: #aaa;
+            pointer-events: none;
+        }
+
+        .misspelled {
+            text-decoration: underline wavy red;
+            text-decoration-skip-ink: none;
+            cursor: text;
+        }
+
+        #context-menu {
+            position: fixed;
+            background: white;
+            border: 1px solid #dadce0;
+            border-radius: 4px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            z-index: 1000;
+            min-width: 180px;
+            display: none;
+            padding: 4px 0;
+        }
+
+        .menu-label {
+            padding: 6px 14px;
+            font-size: 0.75rem;
+            color: #888;
+            font-style: italic;
+        }
+
+        .menu-suggestion {
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: #1a73e8;
+        }
+
+        .menu-suggestion:hover { background: #f1f3f4; }
+
+        .menu-divider {
+            border: none;
+            border-top: 1px solid #e0e0e0;
+            margin: 4px 0;
+        }
+
+        .menu-action {
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 0.88rem;
+            color: #444;
+        }
+
+        .menu-action:hover { background: #f1f3f4; }
+
+        .status-bar {
+            margin-top: 16px;
+            font-size: 0.75rem;
+            color: #888;
+            padding-top: 8px;
+            border-top: 1px solid #f0f0f0;
+        }
+    </style>
+</head>
+<body>
+
+<div class="doc-wrapper">
+    <div id="editor" contenteditable="true" spellcheck="false" placeholder="Start typing..."></div>
+    <div class="status-bar" id="status">Spell check active</div>
+</div>
+
+<div id="context-menu">
+    <div class="menu-label">Spelling suggestions</div>
+    <div id="menu-suggestions"></div>
+    <hr class="menu-divider">
+    <div class="menu-action" id="ignore-word">Ignore</div>
+    <div class="menu-action" id="add-to-dict">Add to dictionary</div>
+</div>
+
+<script>
+    const editor = document.getElementById('editor');
+    const contextMenu = document.getElementById('context-menu');
+    const menuSuggestions = document.getElementById('menu-suggestions');
+    const status = document.getElementById('status');
+
+    // words the user has told me to ignore this session
+    const ignoredWords = new Set();
+    // words the user added to their own dictionary
+    const customDict = new Set();
+
+    // the span the user right-clicked on
+    let currentMisspelledSpan = null;
+    // debounce timer so I'm not hammering the server on every keystroke
+    let checkTimer = null;
+
+    editor.addEventListener('input', () => {
+        clearTimeout(checkTimer);
+        checkTimer = setTimeout(runSpellCheck, 600);
+    });
+
+    async function runSpellCheck() {
+        const sel = window.getSelection();
+        let caretBookmark = null;
+        if (sel.rangeCount) {
+            caretBookmark = getCaretBookmark(editor);
+        }
+
+        const words = extractWords();
+        const misspelledMap = {};
+
+        // deduplicate so I don't hit the server with the same word 10 times
+        const unique = [...new Set(words.map(w => w.text.toLowerCase()))].filter(w =>
+            w.length > 1 && !ignoredWords.has(w) && !customDict.has(w)
+        );
+
+        await Promise.all(unique.map(async (word) => {
+            try {
+                const res = await fetch(`http://localhost:8000/suggest?word=${encodeURIComponent(word)}`);
+                const suggestions = await res.json();
+
+                // my server returns ["WOW ur good at spelling"] when the word is correct,
+                // so I check for that sentinel and skip it — not a real misspelling
+                const CORRECT_SENTINEL = "WOW ur good at spelling";
+                if (suggestions.length === 1 && suggestions[0] === CORRECT_SENTINEL) {
+                    return; // word is fine, move on
+                }
+
+                // if none of the suggestions match the word itself, it's wrong
+                if (!suggestions.some(s => s.toLowerCase() === word.toLowerCase())) {
+                    misspelledMap[word] = suggestions.slice(0, 5);
+                }
+            } catch {
+                // server's probably not running yet, just skip
+            }
+        }));
+
+        rebuildEditorHTML(misspelledMap);
+
+        if (caretBookmark) restoreCaretBookmark(editor, caretBookmark);
+
+        const count = Object.keys(misspelledMap).length;
+        status.textContent = count === 0
+            ? 'No spelling errors detected'
+            : `${count} misspelled word${count > 1 ? 's' : ''} found`;
+    }
+
+    // pull every word out of the raw text so I can check them
+    function extractWords() {
+        const text = editor.innerText;
+        const words = [];
+        const regex = /[a-zA-Z']+/g;
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            words.push({ text: match[0], index: match.index });
+        }
+        return words;
+    }
+
+    // blow away the innerHTML and rebuild it with red underlines on bad words
+    function rebuildEditorHTML(misspelledMap) {
+        const text = editor.innerText;
+        let html = '';
+        let i = 0;
+        const wordRegex = /[a-zA-Z']+/g;
+        let match;
+
+        wordRegex.lastIndex = 0;
+        while ((match = wordRegex.exec(text)) !== null) {
+            // gap before this word (spaces, punctuation, etc.)
+            html += escapeHTML(text.slice(i, match.index));
+
+            const word = match[0];
+            const key = word.toLowerCase();
+            if (misspelledMap[key] && !ignoredWords.has(key)) {
+                const suggestions = JSON.stringify(misspelledMap[key]).replace(/"/g, '&quot;');
+                html += `<span class="misspelled" data-suggestions="${suggestions}" data-word="${word}">${escapeHTML(word)}</span>`;
+            } else {
+                html += escapeHTML(word);
+            }
+            i = match.index + word.length;
+        }
+        html += escapeHTML(text.slice(i));
+        html = html.replace(/\n/g, '<br>');
+        editor.innerHTML = html;
+    }
+
+    function escapeHTML(str) {
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // right-click on a red word → show the suggestions menu
+    editor.addEventListener('contextmenu', (e) => {
+        const span = e.target.closest('.misspelled');
+        if (!span) return;
+
+        e.preventDefault();
+        currentMisspelledSpan = span;
+
+        const suggestions = JSON.parse(span.dataset.suggestions || '[]');
+        menuSuggestions.innerHTML = suggestions.length
+            ? suggestions.map(s =>
+                `<div class="menu-suggestion" data-word="${s}">${s}</div>`
+              ).join('')
+            : '<div class="menu-label">No suggestions</div>';
+
+        contextMenu.style.display = 'block';
+        contextMenu.style.left = e.clientX + 'px';
+        contextMenu.style.top = e.clientY + 'px';
+    });
+
+    // clicking a suggestion swaps the word in place
+    menuSuggestions.addEventListener('click', (e) => {
+        const word = e.target.dataset.word;
+        if (word && currentMisspelledSpan) {
+            currentMisspelledSpan.replaceWith(document.createTextNode(word));
+            hideMenu();
+            runSpellCheck();
+        }
+    });
+
+    // ignore just removes the underline for this session
+    document.getElementById('ignore-word').addEventListener('click', () => {
+        if (currentMisspelledSpan) {
+            ignoredWords.add(currentMisspelledSpan.dataset.word.toLowerCase());
+            currentMisspelledSpan.classList.remove('misspelled');
+            currentMisspelledSpan.removeAttribute('data-suggestions');
+            hideMenu();
+        }
+    });
+
+    // add to dictionary means it'll never get flagged again
+    document.getElementById('add-to-dict').addEventListener('click', () => {
+        if (currentMisspelledSpan) {
+            customDict.add(currentMisspelledSpan.dataset.word.toLowerCase());
+            currentMisspelledSpan.classList.remove('misspelled');
+            currentMisspelledSpan.removeAttribute('data-suggestions');
+            hideMenu();
+        }
+    });
+
+    document.addEventListener('click', hideMenu);
+    document.addEventListener('keydown', hideMenu);
+
+    function hideMenu() {
+        contextMenu.style.display = 'none';
+        currentMisspelledSpan = null;
+    }
+
+    // character-offset bookmark so the caret doesn't jump after I rewrite innerHTML
+    function getCaretBookmark(root) {
+        const sel = window.getSelection();
+        if (!sel.rangeCount) return null;
+        const range = sel.getRangeAt(0);
+        return getTextOffset(root, range.startContainer, range.startOffset);
+    }
+
+    function getTextOffset(root, node, offset) {
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let total = 0;
+        while (walker.nextNode()) {
+            if (walker.currentNode === node) return total + offset;
+            total += walker.currentNode.textContent.length;
+        }
+        return total;
+    }
+
+    function restoreCaretBookmark(root, charOffset) {
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        let total = 0;
+        while (walker.nextNode()) {
+            const len = walker.currentNode.textContent.length;
+            if (total + len >= charOffset) {
+                const range = document.createRange();
+                range.setStart(walker.currentNode, charOffset - total);
+                range.collapse(true);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                return;
+            }
+            total += len;
+        }
+    }
+</script>
+</body>
+</html>
