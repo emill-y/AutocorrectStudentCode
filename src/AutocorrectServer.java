@@ -13,7 +13,7 @@ import java.util.stream.Collectors;
 public class AutocorrectServer {
 
     public static void main(String[] args) throws IOException {
-        // Initialize your existing logic
+        // Initializes existing Autocorrect.java logic
         String[] dict = loadDictionary("large");
         Autocorrect corrector = new Autocorrect(dict, 2);
 
@@ -24,7 +24,7 @@ public class AutocorrectServer {
             // Handle CORS (so the browser doesn't block the request)
             exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
             
-            // Get the "word" from the URL: /suggest?word=aple
+            // Get the "word" from the URL: /suggest?word=mispelledword
             String query = exchange.getRequestURI().getQuery();
             String typed = query != null ? query.split("=")[1] : "";
 
